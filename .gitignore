@@ -1,0 +1,37 @@
+# ---- Datasets ----------------------------------------------------
+# Raw source data. Downloaded from NYC Open Data, not versioned here.
+# The crash CSV alone is 567 MB — well over GitHub's 100 MB file limit.
+*.csv
+*.geojson
+*.parquet
+*.xlsx
+
+# Derived/cached data
+data/
+raw/
+*.pkl
+*.graphml
+
+# ---- Secrets -----------------------------------------------------
+# Supabase keys, Mapbox tokens
+.env
+.env.*
+!.env.example
+
+# ---- Python ------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ---- Node / Next.js ----------------------------------------------
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+
+# ---- OS ----------------------------------------------------------
+.DS_Store
+Thumbs.db
