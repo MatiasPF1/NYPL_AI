@@ -1,12 +1,16 @@
 # ---- Datasets ----------------------------------------------------
-# Raw source data. Downloaded from NYC Open Data, not versioned here.
-# The crash CSV alone is 567 MB — well over GitHub's 100 MB file limit.
+# Raw source data from NYC Open Data. Not versioned — the crash CSV
+# alone is 567 MB, well over GitHub's 100 MB per-file limit.
+# See README.md for download links.
 *.csv
 *.geojson
 *.parquet
 *.xlsx
 
-# Derived/cached data
+# Exception: small derived output the app actually consumes
+!Matias_Section/complaints_scored.csv
+
+# Derived / cached artifacts
 data/
 raw/
 *.pkl
@@ -18,6 +22,17 @@ raw/
 .env.*
 !.env.example
 
+# ---- Node / Next.js ----------------------------------------------
+node_modules/
+.next/
+out/
+build/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-error.log*
+
 # ---- Python ------------------------------------------------------
 __pycache__/
 *.py[cod]
@@ -25,13 +40,8 @@ __pycache__/
 venv/
 .ipynb_checkpoints/
 
-# ---- Node / Next.js ----------------------------------------------
-node_modules/
-.next/
-out/
-.vercel/
-*.tsbuildinfo
-
-# ---- OS ----------------------------------------------------------
+# ---- OS / editor -------------------------------------------------
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
