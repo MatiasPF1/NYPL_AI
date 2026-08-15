@@ -7,14 +7,17 @@
 *.parquet
 *.xlsx
 
-# Exception: small derived output the app actually consumes
-!Matias_Section/complaints_scored.csv
+# Exception: small derived output the app actually consumes. Path-agnostic
+# because these have moved around; keep them committable wherever they land.
+!**/complaints_scored.csv
+!**/flood_sensors.csv
 
-# Derived / cached artifacts
-data/
-raw/
+# Derived / cached artifacts. Note `data/` itself is NOT ignored — git does not
+# descend into an ignored directory, which would make the exceptions above
+# unreachable. The *.csv rule already covers everything large inside it.
 *.pkl
 *.graphml
+data/geocode_cache.json
 
 # ---- Secrets -----------------------------------------------------
 # Supabase keys, Mapbox tokens

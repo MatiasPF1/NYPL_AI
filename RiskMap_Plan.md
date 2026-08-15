@@ -1,10 +1,12 @@
 # RiskMap
 
-**Safest-route navigation for New York City — build plan v3**
+**Safest-route navigation for New York City — build plan v4**
 
 ---
 
-**What we want:** a Next.js map app where you type where you are and where you're going. Instead of the fastest route, it returns the **safest** one — steering around streets with a history of injury crashes, around violent-crime clusters, and around known street-flooding locations when the weather API says heavy rain is hitting that borough. Two routes are drawn side by side so the difference is obvious.
+**What we want:** a mobile app where you say where you are and where you're going. Instead of the fastest route, it returns the **safest** one — steering around streets with a history of injury crashes, around violent-crime clusters, and around known street-flooding locations when the weather API says heavy rain is hitting that borough. Two routes are drawn side by side so the difference is obvious.
+
+**Changed in v4:** the frontend is now Expo (native mobile) instead of Next.js, the backend is a standalone FastAPI service instead of Next.js API routes, and a LangGraph agent sits in front of the router to handle natural-language requests and explain its answers. The data analysis in §3 and the cost model in §4 are unchanged from v3 — they were never web-specific.
 
 ---
 
@@ -12,16 +14,50 @@
 
 | Layer | Choice | Why this one |
 |---|---|---|
-| Frontend | **Next.js** (App Router) | App + API routes in one deploy on Vercel |
-| Database | **Supabase** Postgres + PostGIS | Enable the PostGIS extension — real distance queries and "snap point to nearest road" in SQL instead of Python |
-| Map | **Mapbox GL JS** | 50k loads/month free, no billing card. Includes geocoding (address → lat/lon) so we don't need a second API. Google Maps requires a billing account attached — avoid during a hackathon. |
-| Weather | **Open-Meteo** | No API key, no signup. 5 calls, one per borough. |
-| Routing | **A\*** in a Next.js API route | Graph loaded from Supabase, cached in memory |
-| Prep | Python (pandas) → Supabase | One-off notebooks. Never runs during the demo. |
+| Mobile | **Expo** (React Native, Expo Router) | Native map rendering, real GPS, ships to a phone the judges can hold |
+| Map | **`expo-maps`** — Apple Maps on iOS, Google Maps on Android | Native polyline overlays, which is all we need to draw two routes |
+| Backend | **FastAPI** | Python on both sides — the same `networkx`/`pandas` code preps the graph and serves it |
+| Orchestration | **LangGraph** | Turns a sentence into tool calls, then explains the result. See §5 |
+| Reasoning | **External model API** (Claude) | Intent parsing + the route explanation. Never touches routing math |
+| Database | **Supabase** Postgres + PostGIS | Auth, road graph, saved routes, file storage. PostGIS gives us "snap point to nearest road" in SQL |
+| Routing | **A\*** via `networkx`, in FastAPI | Graph loaded once at startup, held in memory |
+| Weather | **Open-Meteo** | No API key, no signup. 5 calls, one per borough |
+| Prep | Python (**pandas**) → Supabase | One-off notebooks. Never runs during the demo |
+
+> **Be honest about the cost of this stack.** v3 was one deploy. v4 is a phone build, a Python service, and a hosted database — three things that can each be broken independently, and a device that cannot reach `localhost`. That buys real mobile and real agent orchestration, but the integration tax is front-loaded. §9 is ordered to pay it first, on day one, before any data work.
 
 ---
 
-## 2 · The three data layers
+## 2 · Architecture
+
+```
+┌─────────────────────┐
+│  Expo app (phone)   │  Supabase anon key only — no other secrets on device
+│  map · inputs · auth│
+└──────────┬──────────┘
+           │ HTTPS
+           ▼
+┌─────────────────────┐        ┌──────────────────┐
+│  FastAPI            │───────▶│  Model API       │  intent + explanation
+│                     │        └──────────────────┘
+│  /route   ← fast    │        ┌──────────────────┐
+│  /ask     ← agent   │───────▶│  Open-Meteo      │  5 booleans, 15-min cache
+│                     │        └──────────────────┘
+│  A* over in-memory  │        ┌──────────────────┐
+│  graph (networkx)   │◀──────▶│  Supabase        │  graph, hazards, saved routes
+└─────────────────────┘        │  Postgres+PostGIS│
+                               └──────────────────┘
+```
+
+Two rules hold this together:
+
+**Every secret lives in FastAPI.** The Mapbox geocoding token, the model API key, and the Supabase service-role key stay server-side. An Expo bundle is extractable — anything shipped in the app is public. The device carries only the Supabase anon key, which is designed to be public and is fenced by RLS (§7).
+
+**`/route` never depends on the agent.** `POST /route` takes two coordinate pairs and returns two polylines, deterministically, in well under a second. `POST /ask` takes a sentence, runs the LangGraph agent, and calls that same `/route` logic internally. If the model API is slow, rate-limited, or down mid-demo, the map still routes. Build `/route` first and never let the agent become load-bearing for it.
+
+---
+
+## 3 · The three data layers
 
 | Layer | File | Size | State |
 |---|---|---|---|
@@ -87,7 +123,7 @@ The labels are separately broken:
 
 ---
 
-## 3 · How risk becomes a route
+## 4 · How risk becomes a route
 
 Every hazard collapses to one number per street segment. No model, no training — a weighted sum tuned by eye.
 
@@ -101,36 +137,97 @@ cost = length × (1 + α·crash_risk + β·flood_risk·raining + γ·crime_risk)
 | `flood_risk` | 0 – 1 | Segment within 200 m of a FloodNet sensor, scaled by that sensor's event count |
 | `crime_risk` | 0 – 1 | Scored complaints within 100 m, weighted by severity, percentile-ranked |
 | `raining` | 0 or 1 | Open-Meteo says heavy rain in *that segment's borough* |
-| `α, β, γ` | ~2 – 5 | Hand-tuned sliders. α=3 makes a max-risk street feel 4× longer. |
+| `α, β, γ` | ~2 – 5 | Hand-tuned. Exposed as sliders, and settable by the agent (§5) |
 
 > **Keep the penalty multiplicative.** Risk only ever pushes cost *upward*, so `cost ≥ length` always holds — which keeps straight-line distance a valid A\* heuristic and the routes correct. If safe streets were ever made *cheaper* than their true length, A\* would return wrong paths and nothing would visibly break.
 
----
+In FastAPI this is one `networkx` call per route, with the weight computed on the fly:
 
-## 4 · Weather, per borough
+```python
+def edge_cost(u, v, d, w):                     # w = the α/β/γ profile
+    risk = (w.alpha * d["crash_risk"]
+          + w.beta  * d["flood_risk"] * raining[d["borough"]]
+          + w.gamma * d["crime_risk"])
+    return d["length_m"] * (1 + risk)
 
-Open-Meteo, five calls — one per borough centroid. No key required.
-
-```js
-const BOROS = {
-  manhattan:     [40.7831, -73.9712],
-  brooklyn:      [40.6782, -73.9442],
-  queens:        [40.7282, -73.7949],
-  bronx:         [40.8448, -73.8648],
-  staten_island: [40.5795, -74.1502],
-};
-
-// GET api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=precipitation
-// raining[boro] = max(precipitation, next 3h) > 4mm/h
+fast = nx.astar_path(G, src, dst, heuristic=haversine, weight=lambda u,v,d: d["length_m"])
+safe = nx.astar_path(G, src, dst, heuristic=haversine, weight=lambda u,v,d: edge_cost(u,v,d,w))
 ```
 
-Cache in Supabase for 15 minutes so repeated routing requests don't re-hit the API. Five booleans is the entire weather payload.
+---
+
+## 5 · What LangGraph actually does
+
+The agent's job is to decide **what to ask for**, never **what the route is**. Routing stays A\* over a fixed cost function — reproducible, explainable, and unchanged from v3. Keeping that boundary sharp is what makes the project defensible when a judge asks whether the AI is making up the route.
+
+```
+       ┌──────────────────────────────────────────────┐
+       │  "walking home to Bushwick, it's late and    │
+       │   I'd rather not deal with flooding"         │
+       └───────────────────────┬──────────────────────┘
+                               ▼
+                       ┌───────────────┐
+                       │  parse_intent │  model API → structured JSON
+                       └───────┬───────┘
+                               │  origin, destination, mode, concerns[]
+                               ▼
+                       ┌───────────────┐
+                       │  set_profile  │  concerns → α/β/γ  (deterministic table)
+                       └───────┬───────┘
+                               ▼
+              ┌────────────────┼────────────────┐
+              ▼                ▼                ▼
+       ┌───────────┐    ┌───────────┐    ┌───────────┐
+       │  geocode  │    │  weather  │    │  (tools)  │   parallel
+       └─────┬─────┘    └─────┬─────┘    └───────────┘
+             └────────────────┼────────────────┘
+                              ▼
+                      ┌───────────────┐
+                      │  compute_route│  A* ×2 — deterministic, no model
+                      └───────┬───────┘
+                              ▼
+                      ┌───────────────┐
+                      │   explain     │  model API, fed only real numbers
+                      └───────┬───────┘
+                              ▼
+              two polylines + "+4 min, avoids 3 intersections
+              with 2,000 crashes on record and the Rockaways
+              flood cluster"
+```
+
+Four nodes deserve comment:
+
+- **`set_profile`** is a lookup table, not a model call. `"late at night"` → γ up. `"flooding"` → β up. `"I have a stroller"` → α up. The model extracts the *concern*; a hardcoded dict turns it into numbers. A model choosing its own routing weights is unreproducible and impossible to defend.
+- **`compute_route`** calls the identical function `/route` uses. One implementation, two entry points.
+- **`explain`** receives the computed diff — segment counts, crash totals, minutes added — and writes prose. It is never asked what the route *should* be, only to describe what it *was*. That's the difference between an explanation and a hallucination.
+- **State is a `TypedDict`** carrying `intent`, `profile`, `coords`, `weather`, `routes`, `explanation`. Persist it to `agent_runs` (§7) so a failed demo run can be replayed and shown.
+
+---
+
+## 6 · Weather, per borough
+
+Open-Meteo, five calls — one per borough centroid. No key required. Now in FastAPI, cached in Supabase for 15 minutes so repeated routing requests don't re-hit the API.
+
+```python
+BOROS = {
+    "manhattan":     (40.7831, -73.9712),
+    "brooklyn":      (40.6782, -73.9442),
+    "queens":        (40.7282, -73.7949),
+    "bronx":         (40.8448, -73.8648),
+    "staten_island": (40.5795, -74.1502),
+}
+
+# GET api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=precipitation
+# raining[boro] = max(precipitation, next 3h) > 4mm/h
+```
+
+Five booleans is the entire weather payload.
 
 > **Per-borough is the right resolution, and it's honest.** Rain genuinely varies across a 50 km city, so five readings beat one. But it does not vary block to block — the *geography* of flood risk comes from the FloodNet sensors, not the weather API. If a judge asks how granular the weather is: "five boroughs, and the flood sensors supply the street-level detail."
 
 ---
 
-## 5 · Supabase schema
+## 7 · Supabase schema
 
 ```sql
 create extension if not exists postgis;
@@ -178,46 +275,135 @@ create table weather_cache (
 );
 ```
 
-The three `_risk` columns are written once by the prep notebooks. At request time the API route reads `road_edges`, applies the weather booleans, and runs A\*. **Nothing heavy happens during the demo.**
+New in v4 — Supabase now also carries users and their results:
+
+```sql
+-- saved routes, owned by an auth.users row
+create table saved_routes (
+  id           uuid primary key default gen_random_uuid(),
+  user_id      uuid not null references auth.users on delete cascade,
+  label        text,
+  origin       geography(Point, 4326),
+  destination  geography(Point, 4326),
+  fast_path    jsonb,      -- GeoJSON LineString
+  safe_path    jsonb,
+  profile      jsonb,      -- the α/β/γ used
+  stats        jsonb,      -- minutes added, hazards avoided
+  created_at   timestamptz default now()
+);
+
+-- one row per LangGraph invocation, for replay and debugging
+create table agent_runs (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid references auth.users on delete set null,
+  prompt      text,
+  state       jsonb,       -- full graph state
+  latency_ms  int,
+  created_at  timestamptz default now()
+);
+
+alter table saved_routes enable row level security;
+alter table agent_runs   enable row level security;
+
+create policy "own routes" on saved_routes
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "own runs" on agent_runs
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+```
+
+**RLS is not optional here.** The anon key ships inside the app binary and anyone can pull it out. Without those policies, one extracted key reads every user's saved home address. The hazard tables (`road_edges`, `flood_sensors`, `crime_points`, `weather_cache`) are public reference data and can stay readable — but they're also large, so the app should never query them directly. FastAPI does, with the service key.
+
+The three `_risk` columns are written once by the prep notebooks. At request time FastAPI serves from the in-memory graph, applies the weather booleans, and runs A\*. **Nothing heavy happens during the demo.**
 
 ---
 
-## 6 · Build order
+## 8 · The Expo app
+
+Three screens, Expo Router:
+
+| Route | What |
+|---|---|
+| `app/index.tsx` | Map + two address inputs + **Safe route** button. The whole demo lives here |
+| `app/ask.tsx` | Single text box → `POST /ask` → route drawn + explanation card |
+| `app/saved.tsx` | Supabase auth (magic link) + list of `saved_routes` |
+
+Drawing both routes is one prop — `polylines` takes an array, so grey and green go up together:
+
+```tsx
+<AppleMaps.View
+  style={{ flex: 1 }}
+  cameraPosition={{ coordinates: NYC, zoom: 13 }}
+  polylines={[
+    { coordinates: fastPath, color: "#9ca3af", width: 4 },
+    { coordinates: safePath, color: "#22c55e", width: 6 },
+  ]}
+/>
+```
+
+Four constraints to plan around, all of them capable of eating an afternoon:
+
+- **`expo-maps` does not run in Expo Go.** It's alpha and needs a [development build](https://docs.expo.dev/develop/development-builds/introduction/) (`npx expo run:ios`, or EAS). Do this on day one — discovering it at hour 20 is fatal.
+- **Demo on iOS if you can.** Apple Maps needs zero configuration. Google Maps on Android requires a Google Cloud project, the Maps SDK enabled, and an API key restricted to your package name *and* your build's SHA-1 fingerprint. That's the same billing-account friction v3 avoided by picking Mapbox — it comes back on Android, and only on Android.
+- **The phone cannot reach `localhost`.** Run FastAPI bound to `0.0.0.0` and point the app at your machine's LAN IP, or tunnel it. Put the base URL in one `EXPO_PUBLIC_API_URL` env var so switching between laptop and deployed backend is a one-line change.
+- **Geocoding stays server-side.** The app sends the typed string to FastAPI, which calls Mapbox and returns coordinates. Keeps the token off the device and means one geocoding implementation shared with the agent's `geocode` node.
+
+---
+
+## 9 · Build order
 
 | # | Phase | Time | What |
 |---|---|---|---|
-| 1 | **Map + graph** | ~1 hr | Next.js page with Mapbox, two address inputs via Mapbox geocoding. Load the Manhattan street graph (OSMnx → `road_edges`), run plain A\* on distance. *No risk data yet* — but already a working routing app, so we can never end with nothing. |
+| 0 | **Skeleton, end to end** | ~1.5 hr | Dev build on a real phone showing a map with a hardcoded polyline, fetched from a FastAPI `/health` on your LAN. No data, no agent. **This proves the three-tier stack talks to itself** — every hour spent here is repaid twice. |
+| 1 | **Map + graph** | ~1 hr | Two address inputs → FastAPI `/geocode`. Load the Manhattan street graph (OSMnx → `road_edges`), hold it in memory, run plain A\* on distance. *No risk data yet* — but already a working routing app, so we can never end with nothing. |
 | 2 | **Crash layer** | ~2 hrs | Filter 2022+, drop the `(0,0)` rows, snap to nearest edge with PostGIS, aggregate injury-weighted score, percentile-rank, write `crash_risk`. Test on 10k rows before running all 414k. |
-| 3 | **Two-route comparison** | ~30 min | Run A\* twice per request — once on length, once on risk-weighted cost. Draw grey and green lines. **This is where it becomes a demo instead of a map.** |
+| 3 | **Two-route comparison** | ~30 min | Run A\* twice per request. Return both as GeoJSON, draw grey and green. **This is where it becomes a demo instead of a map.** |
 | 4 | **Crime layer** | ~30 min | Load `complaints_scored.csv` into `crime_points`, set `crime_risk` on edges within 100 m. *Notebook already done.* |
 | 5 | **Flood layer** | ~1 hr | Geocode the 294 sensor names, load `flood_sensors`, set `flood_risk` on edges within 200 m, add the β term behind a manual rain toggle. |
 | 6 | **Weather API** | ~20 min | Replace the toggle with 5 live Open-Meteo calls. **Keep the manual override** — it probably won't be raining during the demo. |
-| 7 | **Polish** | what's left | Reason string ("avoided 3 high-crash intersections, +4 min"), heat-map toggles, and α/β/γ sliders judges can drag. |
+| 7 | **LangGraph agent** | ~2 hrs | The §5 graph behind `/ask`, plus the `ask` screen. Wire `parse_intent` → `set_profile` → `compute_route` → `explain`. Log every run to `agent_runs`. |
+| 8 | **Auth + saved routes** | ~1 hr | Supabase magic-link sign-in, save a computed route, list it back. RLS policies on from the start, not bolted on after. |
+| 9 | **Polish** | what's left | Heat-map overlays, α/β/γ sliders judges can drag, and a nicer explanation card. |
+
+> **Protect one thing:** finish phase 3 early. Crashes + two-route comparison on a phone is already a complete, defensible project. Crime, flood, weather, the agent and auth all make it better — none of them are prerequisites for having something that works.
 
 ---
 
-## 7 · Demo
+## 10 · Demo
 
-1. Enter start and destination. Grey line appears — "this is what Google gives you."
+1. Open the app on a phone. Enter start and destination. Grey line appears — "this is what Google gives you."
 2. Hit **Safe route**. Green line diverges around the high-crash corridors. "+4 minutes, avoids three intersections with 2,000 crashes on record."
-3. Flip heavy rain on for Queens. The green route **moves again**, now dodging the Rockaways flood cluster.
-4. Drag the α slider up and watch the route grow more cautious in real time.
-
-> **Protect one thing:** finish step 3 early. Crashes + two-route comparison is already a complete, defensible project. Crime, flood and weather make it better — they are not prerequisites for having something that works.
-
----
-
-## 8 · Repo
-
-| File | What |
-|---|---|
-| `inspect_dataset.ipynb` | Generic dataset profiler — set `DATA_PATH`, run all |
-| `classify_complaints.ipynb` | Crime severity scoring 1–5 + geographic cleaning → `complaints_scored.csv` |
-| `RiskMap_Plan.md` / `.pdf` | This plan |
-| `.gitignore` | Ignores all `*.csv` (the crash file alone is 567 MB) and `.env` |
-
-Datasets are **not** committed. Re-download from NYC Open Data, or use `git add -f` for small derived files.
+3. Switch to the **Ask** tab and type *"walking home to Bushwick, it's late and I'd rather not deal with flooding."* The agent parses it, weights crime and flood higher, and the route redraws with a written explanation.
+4. Flip heavy rain on for Queens. The green route **moves again**, now dodging the Rockaways flood cluster.
+5. Sign in, save the route, show it persisting under your account.
 
 ---
 
-*RiskMap build plan v3 · Next.js + Supabase/PostGIS + Mapbox + Open-Meteo · crash data 2,269,187 records (2012-07-01 → 2026-06-11) · FloodNet 2,929 events across 294 sensors · 4,823 complaints scored at severity ≥ 4*
+## 11 · Repo
+
+```
+expo-app/          Expo Router app
+  app/_layout.tsx      auth gate — Stack.Protected on session state
+  app/login.tsx        Apple (native) + Google (browser OAuth) + guest
+  app/(app)/index.tsx  "Where to?" — the main screen
+  lib/theme.ts         colors, spacing, type. No hex values live outside it
+  lib/auth.tsx         session context, the three sign-in paths
+  lib/supabase.ts      anon-key client, AsyncStorage-backed sessions
+backend/           FastAPI
+  main.py              /health  →  /geocode /route /ask
+  routing.py           graph load + A*  (the only place cost is computed)
+  agent/graph.py       LangGraph nodes and state
+  weather.py           Open-Meteo + 15-min cache
+Matias_Section/
+  inspect_dataset.ipynb        generic dataset profiler
+  classify_complaints.ipynb    crime severity 1-5 → complaints_scored.csv
+  build_graph.ipynb            OSMnx → road_edges
+  score_edges.ipynb            crash/flood/crime → the three _risk columns
+  RiskMap_Plan.md              this plan
+.gitignore                     all *.csv (the crash file alone is 567 MB), .env
+```
+
+Datasets are **not** committed. Re-download from NYC Open Data, or use `git add -f` for small derived files. Secrets live in `backend/.env` (model API key, Mapbox token, Supabase service key) and `expo-app/.env` (`EXPO_PUBLIC_API_URL`, Supabase URL + anon key — those two are safe to ship).
+
+---
+
+*RiskMap build plan v4 · Expo + FastAPI + LangGraph + Supabase/PostGIS + Open-Meteo · crash data 2,269,187 records (2012-07-01 → 2026-06-11) · FloodNet 2,929 events across 294 sensors · 4,823 complaints scored at severity ≥ 4*

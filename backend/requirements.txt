@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+httpx
+
+# Phase 1+ — uncomment as each phase lands
+# networkx          # A* over the road graph
+# pandas            # the prep + scoring pipelines
+# osmnx             # street graph download
+# supabase          # service-key client
+# langgraph         # agent orchestration (phase 7)
+# anthropic         # intent parsing + explanation (phase 7)
