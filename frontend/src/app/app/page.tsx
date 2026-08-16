@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import { signOut } from "@/components/Login_Page/actions";
 import { Wordmark } from "@/components/ui/wordmark";
@@ -31,16 +32,24 @@ export default async function AppPage() {
 
   return (
     <div className="flex min-h-svh flex-col bg-black font-sans text-white">
-      <header className="flex items-center justify-between p-6 sm:p-10">
+      <header className="flex items-center justify-between gap-3 p-6 sm:p-10">
         <Wordmark tone="light" />
-        <form action={signOut}>
-          <button
-            type="submit"
-            className="rounded-lg border border-white/25 px-4 py-2 text-[14px] font-medium text-white transition-colors hover:border-white/60"
+        <div className="flex items-center gap-2">
+          <Link
+            href="/map"
+            className="rounded-lg bg-white px-4 py-2 text-[14px] font-medium text-black no-underline transition-opacity hover:opacity-85"
           >
-            Sign out
-          </button>
-        </form>
+            Plan a route
+          </Link>
+          <form action={signOut}>
+            <button
+              type="submit"
+              className="rounded-lg border border-white/25 px-4 py-2 text-[14px] font-medium text-white transition-colors hover:border-white/60"
+            >
+              Sign out
+            </button>
+          </form>
+        </div>
       </header>
 
       <main className="mx-auto w-full max-w-[620px] px-6 pb-24">

@@ -30,6 +30,12 @@ function Overlay() {
 
         <nav className="flex items-center gap-1 sm:gap-2">
           <Link
+            href="/map"
+            className="pointer-events-auto hidden rounded-lg px-3 py-2 text-[14px] font-medium text-white/70 no-underline transition-colors hover:text-white sm:block"
+          >
+            See the map
+          </Link>
+          <Link
             href="/login"
             className="pointer-events-auto rounded-lg px-3 py-2 text-[14px] font-medium text-white/70 no-underline transition-colors hover:text-white"
           >
@@ -82,6 +88,19 @@ function Overlay() {
               Log in
             </Link>
           </div>
+
+          {/* The demo needs a door on the landing page. No account, no inbox
+              round trip — just the two lines. */}
+          <p className="mt-5 text-[15px] text-white/50">
+            Or{" "}
+            <Link
+              href="/map"
+              className="pointer-events-auto font-medium text-white underline-offset-4 hover:underline"
+            >
+              see two routes across Manhattan
+            </Link>{" "}
+            — no account needed.
+          </p>
         </div>
       </div>
     </div>
