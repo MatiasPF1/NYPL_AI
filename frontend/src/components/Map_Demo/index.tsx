@@ -10,8 +10,10 @@ import {
   setWorkerUrl,
   type MapMouseEvent,
 } from "maplibre-gl";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import "maplibre-gl/dist/maplibre-gl.css";
+import { deleteRoute, saveRoute, type SavedRoute } from "@/components/Map_Demo/actions";
 import { Wordmark } from "@/components/ui/wordmark";
 
 const ROUTER = process.env.NEXT_PUBLIC_ROUTER_URL ?? "http://127.0.0.1:8000";
@@ -54,9 +56,36 @@ type Path = {
   distance_m: number;
   risk_exposure: number;
   risky_segments: number;
+  flood_exposure: number;
+  flooded_segments: number;
   geometry: { type: "LineString"; coordinates: [number, number][] };
 };
-type RouteResponse = { shortest: Path; safest: Path; reason: string };
+type Borough = { mm_h: number | null; raining: boolean; armed: boolean };
+type Weather = {
+  override: Rain;
+  available: boolean;
+  armed_anywhere: boolean;
+  threshold_mm_h: number;
+  age_s: number | null;
+  boroughs: Record<string, Borough>;
+};
+type RouteResponse = {
+  shortest: Path;
+  safest: Path;
+  reason: string;
+  weather: Weather;
+};
+
+/** Whether the flood term is armed: by the weather, or by hand. */
+type Rain = "auto" | "on" | "off";
+
+const BOROUGH_LABEL: Record<string, string> = {
+  manhattan: "Manhattan",
+  brooklyn: "Brooklyn",
+  queens: "Queens",
+  bronx: "the Bronx",
+  staten_island: "Staten Island",
+};
 
 const PRESET = {
   label: "Times Sq → Washington Sq",
@@ -78,9 +107,30 @@ const EMPTY = { type: "FeatureCollection" as const, features: [] };
 function addLayers(m: MapLibreMap) {
   if (m.getSource("risk")) return;
 
+  m.addSource("flood", { type: "geojson", data: EMPTY });
   m.addSource("risk", { type: "geojson", data: EMPTY });
   m.addSource("shortest", { type: "geojson", data: EMPTY });
   m.addSource("safest", { type: "geojson", data: EMPTY });
+
+  // Flooding sits at the bottom of the stack, in cyan. The crash ramp ends in
+  // warm reds, so the two layers never have to be told apart by position —
+  // water reads cold, traffic reads hot, and both can be on at once.
+  m.addLayer({
+    id: "flood",
+    type: "line",
+    source: "flood",
+    layout: { "line-cap": "round" },
+    paint: {
+      "line-color": [
+        "interpolate", ["linear"], ["get", "risk"],
+        0, "#0E4F63",
+        0.5, "#22D3EE",
+        1, "#A5F3FC",
+      ],
+      "line-width": ["interpolate", ["linear"], ["get", "risk"], 0, 1.5, 1, 5],
+      "line-opacity": 0.7,
+    },
+  });
 
   // Heatmap underneath, so a route never disappears behind the risk it is
   // avoiding. Colour and width both ramp with the score: on a dark map, hue
@@ -128,8 +178,10 @@ function addLayers(m: MapLibreMap) {
 
 type Painted = {
   risk: unknown | null;
+  flood: unknown | null;
   result: RouteResponse | null;
   heat: boolean;
+  wet: boolean;
 };
 
 /**
@@ -143,12 +195,15 @@ type Painted = {
 function applyData(m: MapLibreMap, state: Painted) {
   if (!m.getSource("risk")) return;
 
-  if (state.risk) {
-    (m.getSource("risk") as GeoJSONSource).setData(
-      state.risk as GeoJSON.FeatureCollection,
-    );
+  for (const [key, data, on] of [
+    ["risk", state.risk, state.heat],
+    ["flood", state.flood, state.wet],
+  ] as const) {
+    if (data) {
+      (m.getSource(key) as GeoJSONSource).setData(data as GeoJSON.FeatureCollection);
+    }
+    m.setLayoutProperty(key, "visibility", on ? "visible" : "none");
   }
-  m.setLayoutProperty("risk", "visibility", state.heat ? "visible" : "none");
 
   for (const key of ["shortest", "safest"] as const) {
     (m.getSource(key) as GeoJSONSource).setData(
@@ -159,10 +214,18 @@ function applyData(m: MapLibreMap, state: Painted) {
   }
 }
 
-export function MapDemo({ account }: { account?: React.ReactNode }) {
+export function MapDemo({
+  account,
+  saved,
+}: {
+  account?: React.ReactNode;
+  /** Present only on /app, where there is a session to own them. */
+  saved?: SavedRoute[];
+}) {
   const container = useRef<HTMLDivElement>(null);
   const map = useRef<MapLibreMap | null>(null);
   const markers = useRef<Marker[]>([]);
+  const router = useRouter();
 
   const [ready, setReady] = useState(false);
   const [pins, setPins] = useState<{ from: Point | null; to: Point | null }>({
@@ -177,10 +240,22 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
   const [busy, setBusy] = useState(false);
   const [heat, setHeat] = useState(true);
   const [heatCount, setHeatCount] = useState<number | null>(null);
+  const [wet, setWet] = useState(false);
+  const [floodCount, setFloodCount] = useState<number | null>(null);
+  const [rain, setRain] = useState<Rain>("auto");
+  const [weather, setWeather] = useState<Weather | null>(null);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
   // Mirrors of the map's data, so it can be replayed after a style swap
   // destroys every source. Refs, not state: the map listeners that read this
   // are registered once and would otherwise close over stale values.
-  const painted = useRef<Painted>({ risk: null, result: null, heat: true });
+  const painted = useRef<Painted>({
+    risk: null,
+    flood: null,
+    result: null,
+    heat: true,
+    wet: false,
+  });
   // Anything that stops the basemap from drawing. Kept separate from `error`
   // (which is about routing) so a dead map never looks like a dead router.
   const [mapError, setMapError] = useState<string | null>(null);
@@ -294,21 +369,26 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
     };
   }, []);
 
-  // --- load the risk heatmap once -----------------------------------------
+  // --- load both hazard layers once ---------------------------------------
   useEffect(() => {
     if (!ready) return;
     let cancelled = false;
     (async () => {
-      try {
-        const res = await fetch(`${ROUTER}/risk`);
-        if (!res.ok) return;
-        const data = await res.json();
-        if (cancelled) return;
-        painted.current.risk = data;
-        if (map.current) applyData(map.current, painted.current);
-        setHeatCount(data.features.length);
-      } catch {
-        // The heatmap is decoration; routing is the product. Fail quietly.
+      for (const [path, key, count] of [
+        ["/risk", "risk", setHeatCount],
+        ["/flood", "flood", setFloodCount],
+      ] as const) {
+        try {
+          const res = await fetch(`${ROUTER}${path}`);
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (cancelled) return;
+          painted.current[key] = data;
+          if (map.current) applyData(map.current, painted.current);
+          count(data.features.length);
+        } catch {
+          // The overlays are decoration; routing is the product. Fail quietly.
+        }
       }
     })();
     return () => {
@@ -318,10 +398,33 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
 
   useEffect(() => {
     painted.current.heat = heat;
+    painted.current.wet = wet;
     const m = map.current;
     if (!m || !ready || !m.getLayer("risk")) return;
     m.setLayoutProperty("risk", "visibility", heat ? "visible" : "none");
-  }, [heat, ready]);
+    m.setLayoutProperty("flood", "visibility", wet ? "visible" : "none");
+  }, [heat, wet, ready]);
+
+  // --- the weather gate ----------------------------------------------------
+  // Read once per override change, so the panel can say whether the flood term
+  // is armed before anyone runs a route. The router caches Open-Meteo for an
+  // hour, so this is cheap however often it is called.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${ROUTER}/weather?rain=${rain}`);
+        if (!res.ok) return;
+        const data: Weather = await res.json();
+        if (!cancelled) setWeather(data);
+      } catch {
+        if (!cancelled) setWeather(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rain]);
 
   // --- click to place pins -------------------------------------------------
   useEffect(() => {
@@ -371,13 +474,16 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
   }, [from, to]);
 
   // --- routing -------------------------------------------------------------
+  // `rain` is a dependency, not a captured value: changing the override has to
+  // re-run the search, because it changes the cost function the router uses.
   const run = useCallback(async (a: Point, b: Point) => {
     setBusy(true);
     setError(null);
+    setSaveMsg(null);
     try {
       const res = await fetch(
         `${ROUTER}/route?from_lat=${a.lat}&from_lng=${a.lng}` +
-          `&to_lat=${b.lat}&to_lng=${b.lng}`,
+          `&to_lat=${b.lat}&to_lng=${b.lng}&rain=${rain}`,
       );
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -385,6 +491,7 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
       }
       const data: RouteResponse = await res.json();
       setResult(data);
+      setWeather(data.weather);
       painted.current.result = data;
 
       const m = map.current;
@@ -412,7 +519,7 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [rain]);
 
   useEffect(() => {
     if (from && to) void run(from, to);
@@ -452,13 +559,75 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
     setToText("");
     setResult(null);
     setError(null);
+    setSaveMsg(null);
     painted.current.result = null;
     if (map.current) applyData(map.current, painted.current);
+  };
+
+  // --- saved walks ---------------------------------------------------------
+  const save = () => {
+    if (!result || !from || !to) return;
+    const typed = fromText.trim() && toText.trim()
+      ? `${fromText.trim()} → ${toText.trim()}`
+      : null;
+    startTransition(async () => {
+      const res = await saveRoute({
+        name: typed,
+        origin: from,
+        dest: to,
+        coordinates: result.safest.geometry.coordinates,
+        distanceM: result.safest.distance_m,
+        riskExposure: result.safest.risk_exposure,
+      });
+      setSaveMsg(res.ok ? "Saved." : res.error);
+      // The list is rendered on the server, so it only changes when the server
+      // re-renders the page.
+      if (res.ok) router.refresh();
+    });
+  };
+
+  const remove = (id: string) => {
+    startTransition(async () => {
+      const res = await deleteRoute(id);
+      if (res.ok) router.refresh();
+      else setSaveMsg(res.error);
+    });
+  };
+
+  const load = (r: SavedRoute) => {
+    setSaveMsg(null);
+    setFromText("");
+    setToText("");
+    // Re-routed rather than replayed from the stored geometry, on purpose: the
+    // scores and the weather have both moved on since it was saved, and the
+    // honest answer is today's safest walk between the same two points.
+    setPins({
+      from: { lat: r.origin_lat, lng: r.origin_lng },
+      to: { lat: r.dest_lat, lng: r.dest_lng },
+    });
   };
 
   const extra = result
     ? Math.round(result.safest.distance_m - result.shortest.distance_m)
     : 0;
+
+  // What the gate is doing, in one sentence.
+  const armedBoroughs = weather
+    ? Object.entries(weather.boroughs)
+        .filter(([, b]) => b.armed)
+        .map(([key]) => BOROUGH_LABEL[key] ?? key)
+    : [];
+  const gateLine = !weather
+    ? "Weather unavailable — flood risk is off."
+    : rain === "on"
+      ? "Forced on — flood risk counts in all five boroughs."
+      : rain === "off"
+        ? "Forced off — flood risk is ignored."
+        : !weather.available
+          ? "Weather unavailable — flood risk is off."
+          : armedBoroughs.length
+            ? `Heavy rain in ${armedBoroughs.join(", ")} — flood risk counts there.`
+            : `No heavy rain right now — flood risk is off.`;
 
   const field =
     "w-full rounded-lg border border-white/15 bg-white/5 px-3.5 py-2.5 text-[14px] text-white transition-colors placeholder:text-white/35 hover:border-white/25 focus:border-white/60 focus:outline-none";
@@ -588,6 +757,27 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
                   ? "No detour needed on this trip."
                   : `About ${extra} m further — roughly ${Math.max(1, Math.round(extra / 80))} min of extra walking.`}
               </p>
+
+              {saved && (
+                <div className="mt-4 flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={save}
+                    disabled={pending}
+                    className="rounded-lg border border-white/25 px-3.5 py-2 text-[13px] font-medium text-white transition-colors hover:border-white/60 disabled:opacity-40"
+                  >
+                    {pending ? "Saving…" : "Save this walk"}
+                  </button>
+                  {saveMsg && (
+                    <span
+                      role="status"
+                      className={`text-[13px] ${saveMsg === "Saved." ? "text-white/45" : "text-[#FF8A80]"}`}
+                    >
+                      {saveMsg}
+                    </span>
+                  )}
+                </div>
+              )}
             </>
           )}
 
@@ -624,6 +814,80 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
                 </p>
               </>
             )}
+
+            <label className="mt-4 flex cursor-pointer items-center justify-between gap-3">
+              <span className="text-[14px] font-medium">Street flooding</span>
+              <input
+                type="checkbox"
+                checked={wet}
+                onChange={(e) => setWet(e.target.checked)}
+                className="h-4 w-4 accent-[#22D3EE]"
+              />
+            </label>
+
+            {wet && (
+              <>
+                <div
+                  aria-hidden
+                  className="mt-3 h-1.5 w-full rounded-full"
+                  style={{ background: "linear-gradient(90deg,#0E4F63,#22D3EE,#A5F3FC)" }}
+                />
+                <div className="mt-1.5 flex justify-between font-mono text-[10px] tracking-wider text-white/40 uppercase">
+                  <span>Lower</span>
+                  <span>Higher</span>
+                </div>
+                <p className="mt-2.5 text-[12px] leading-[1.5] text-white/40">
+                  {floodCount === null
+                    ? "Loading…"
+                    : `${floodCount.toLocaleString()} segments within 200 m of a FloodNet sensor, weighted by how often and how deep it floods.`}
+                </p>
+              </>
+            )}
+          </div>
+
+          {/* The weather gate — what decides whether flooding counts at all */}
+          <div className="mt-5 border-t border-white/10 pt-4">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-[14px] font-medium">Rain</span>
+              <div
+                role="group"
+                aria-label="Rain override"
+                className="flex overflow-hidden rounded-lg border border-white/15"
+              >
+                {(
+                  [
+                    ["auto", "Auto"],
+                    ["on", "Rain"],
+                    ["off", "Dry"],
+                  ] as const
+                ).map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    aria-pressed={rain === value}
+                    onClick={() => setRain(value)}
+                    className={`px-3 py-1.5 text-[12px] font-medium transition-colors ${
+                      rain === value
+                        ? "bg-white text-black"
+                        : "text-white/60 hover:text-white"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <p className="mt-2.5 text-[12px] leading-[1.5] text-white/40">{gateLine}</p>
+
+            {weather?.available && rain === "auto" && (
+              <p className="mt-1.5 font-mono text-[10px] leading-[1.6] text-white/30">
+                {Object.entries(weather.boroughs)
+                  .map(([key, b]) => `${BOROUGH_LABEL[key] ?? key} ${b.mm_h ?? "–"}`)
+                  .join(" · ")}{" "}
+                mm/h · arms above {weather.threshold_mm_h}
+              </p>
+            )}
           </div>
 
           <button
@@ -636,6 +900,47 @@ export function MapDemo({ account }: { account?: React.ReactNode }) {
           >
             Try {PRESET.label}
           </button>
+
+          {/* Saved walks — only rendered where there is a session to own them */}
+          {saved && (
+            <div className="mt-5 border-t border-white/10 pt-4">
+              <h2 className="text-[14px] font-medium">Saved walks</h2>
+              {saved.length === 0 ? (
+                <p className="mt-2 text-[12px] leading-[1.5] text-white/40">
+                  Nothing saved yet. Run a route and press Save.
+                </p>
+              ) : (
+                <ul className="mt-2 flex flex-col gap-1">
+                  {saved.map((r) => (
+                    <li key={r.id} className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => load(r)}
+                        className="min-w-0 flex-1 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-white/10"
+                      >
+                        <span className="block truncate text-[13px] text-white">
+                          {r.name ?? "Dropped pins"}
+                        </span>
+                        <span className="block text-[11px] tabular-nums text-white/40">
+                          {r.distance_m ? `${(r.distance_m / 1000).toFixed(2)} km · ` : ""}
+                          {new Date(r.created_at).toLocaleDateString()}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => remove(r.id)}
+                        disabled={pending}
+                        aria-label={`Delete ${r.name ?? "saved walk"}`}
+                        className="shrink-0 rounded-lg px-2 py-1.5 text-[12px] text-white/40 transition-colors hover:text-[#FF8A80] disabled:opacity-40"
+                      >
+                        Delete
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
