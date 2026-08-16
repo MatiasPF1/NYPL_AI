@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { CollectionSurfer } from "@/components/ui/collection-surfer";
 import { NYC_COLLECTION } from "@/lib/nyc-collection";
-import { Wordmark } from "./Wordmark";
+import { Wordmark } from "@/components/ui/wordmark";
 
 /**
  * The whole landing page: the collection surfs the three boroughs while the
@@ -36,7 +36,7 @@ function Overlay() {
             Log in
           </Link>
           <Link
-            href="/login"
+            href="/signup"
             className="pointer-events-auto rounded-lg bg-white px-4 py-2.5 text-[14px] font-medium text-black no-underline transition-opacity hover:opacity-85"
           >
             Get started
@@ -70,7 +70,7 @@ function Overlay() {
 
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
-              href="/login"
+              href="/signup"
               className="pointer-events-auto rounded-lg bg-white px-6 py-3.5 text-[15px] font-medium text-black no-underline transition-opacity hover:opacity-85"
             >
               Get started
