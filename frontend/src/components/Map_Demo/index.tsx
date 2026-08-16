@@ -126,7 +126,50 @@ const PRESET = {
   to: { lat: 40.7308, lng: -73.9973 },
 };
 
+/**
+ * The saved walk the dry-vs-rain comparison runs on.
+ *
+ * Not chosen by hand: every pair of downtown landmarks was routed twice, dry
+ * and armed, and this one came back with the largest change for the smallest
+ * detour. The shortest way crosses five blocks FloodNet has measured
+ * underwater; the rain-aware route crosses none, for 34 m. Short enough to be
+ * a walk someone would actually take (~21 min), which the multi-kilometre
+ * pairs that also diverge are not.
+ */
+const STORM = {
+  label: "Alphabet City → Delancey St",
+  fromText: "Alphabet City",
+  toText: "Delancey & Essex",
+  from: { lat: 40.725, lng: -73.977 },
+  to: { lat: 40.7183, lng: -73.988 },
+};
+
 const EMPTY = { type: "FeatureCollection" as const, features: [] };
+
+// --- the colour system ----------------------------------------------------
+//
+// Four things have to stay apart on a dark map seen from the back of a room:
+// the safe walk, the fast walk, crash risk, and flooding. These were validated
+// as a set rather than picked by eye — worst pair ΔE 9.7 under deuteranopia,
+// 20.6 with normal vision, all four above 3:1 against the basemap.
+//
+// The rule that makes it readable: **hazards own the hue ramps, routes own the
+// bright end.** Neither ramp is allowed near a route colour, and every route
+// gets a dark casing so it never blends into the hazard it is avoiding.
+const SAFEST = "#00E58A"; // the recommended walk
+const FASTEST = "#FFFFFF"; // what your phone would give you — dashed, achromatic
+const RAIN_ROUTE = "#FFB020"; // the same walk, re-solved for a storm
+const CASING = "#05070A"; // the halo that lifts a route off the heatmap
+
+// Sequential, single-hue, monotone in lightness: dark where risk is low, bright
+// where it is high.
+//
+// The previous ramp ran blue → cyan → yellow → orange → red, which is a rainbow
+// and peaked in brightness at *medium* risk (OKLab L 0.46, 0.66, 0.84, 0.69,
+// 0.62). The loudest streets on the map were not the worst ones, and its blue
+// low end was the same colour as the route. Both are fixed by ramping one hue.
+const CRASH_RAMP = ["#4A1620", "#8C1D2B", "#D42A36", "#FF5347"] as const;
+const FLOOD_RAMP = ["#12345E", "#2F6FD0", "#6FB2FF"] as const;
 
 /**
  * Sources and layers for the routes and the heatmap.
@@ -141,11 +184,12 @@ function addLayers(m: MapLibreMap) {
   m.addSource("flood", { type: "geojson", data: EMPTY });
   m.addSource("risk", { type: "geojson", data: EMPTY });
   m.addSource("shortest", { type: "geojson", data: EMPTY });
+  m.addSource("rain", { type: "geojson", data: EMPTY });
   m.addSource("safest", { type: "geojson", data: EMPTY });
 
-  // Flooding sits at the bottom of the stack, in cyan. The crash ramp ends in
-  // warm reds, so the two layers never have to be told apart by position —
-  // water reads cold, traffic reads hot, and both can be on at once.
+  // Flooding sits at the bottom of the stack, ramping one blue. Water reads
+  // cold and traffic reads hot, so the two hazards never have to be told apart
+  // by position, and both can be on at once.
   m.addLayer({
     id: "flood",
     type: "line",
@@ -154,18 +198,32 @@ function addLayers(m: MapLibreMap) {
     paint: {
       "line-color": [
         "interpolate", ["linear"], ["get", "risk"],
-        0, "#0E4F63",
-        0.5, "#22D3EE",
-        1, "#A5F3FC",
+        0, FLOOD_RAMP[0],
+        0.5, FLOOD_RAMP[1],
+        1, FLOOD_RAMP[2],
       ],
-      "line-width": ["interpolate", ["linear"], ["get", "risk"], 0, 1.5, 1, 5],
-      "line-opacity": 0.7,
+      // Width answers to the score *and* the zoom. Five thousand segments at
+      // street width is a solid wash when the whole island is on screen; the
+      // same widths are too thin to see once you are down at block level.
+      "line-width": [
+        "interpolate", ["linear"], ["zoom"],
+        11, ["interpolate", ["linear"], ["get", "risk"], 0, 0.4, 1, 2],
+        14, ["interpolate", ["linear"], ["get", "risk"], 0, 1, 1, 4.5],
+        17, ["interpolate", ["linear"], ["get", "risk"], 0, 1.5, 1, 8],
+      ],
+      // Barely-scored segments stay nearly invisible on purpose. Painting every
+      // scored block at one strength is what turned this into a wash of colour;
+      // the eye should land on the blocks that actually flood.
+      "line-opacity": [
+        "interpolate", ["linear"], ["get", "risk"],
+        0, 0.2, 0.5, 0.7, 1, 0.95,
+      ],
     },
   });
 
-  // Heatmap underneath, so a route never disappears behind the risk it is
-  // avoiding. Colour and width both ramp with the score: on a dark map, hue
-  // alone is hard to rank, width makes the tail unmissable.
+  // Crash risk above it, ramping one red. Colour, width and opacity all climb
+  // with the same number — three encodings of one value, so the worst blocks
+  // are unmistakable even projected onto a wall from the back of a room.
   m.addLayer({
     id: "risk",
     type: "line",
@@ -174,43 +232,76 @@ function addLayers(m: MapLibreMap) {
     paint: {
       "line-color": [
         "interpolate", ["linear"], ["get", "risk"],
-        0, "#2E5A88",
-        0.25, "#3F9BD9",
-        0.5, "#F5C518",
-        0.75, "#FF6319",
-        1, "#EE352E",
+        0, CRASH_RAMP[0],
+        0.33, CRASH_RAMP[1],
+        0.66, CRASH_RAMP[2],
+        1, CRASH_RAMP[3],
       ],
-      "line-width": ["interpolate", ["linear"], ["get", "risk"], 0, 1.5, 1, 4.5],
-      "line-opacity": 0.75,
+      "line-width": [
+        "interpolate", ["linear"], ["zoom"],
+        11, ["interpolate", ["linear"], ["get", "risk"], 0, 0.4, 1, 2.2],
+        14, ["interpolate", ["linear"], ["get", "risk"], 0, 1, 1, 5],
+        17, ["interpolate", ["linear"], ["get", "risk"], 0, 1.5, 1, 9],
+      ],
+      "line-opacity": [
+        "interpolate", ["linear"], ["get", "risk"],
+        0, 0.25, 0.5, 0.75, 1, 1,
+      ],
     },
   });
 
-  // Shortest below safest, so the divergence is what the eye catches.
-  m.addLayer({
-    id: "shortest",
-    type: "line",
-    source: "shortest",
-    layout: { "line-cap": "round", "line-join": "round" },
-    paint: {
-      "line-color": "#FFFFFF",
-      "line-width": 3,
-      "line-opacity": 0.55,
-      "line-dasharray": [2, 2],
-    },
-  });
-  m.addLayer({
-    id: "safest",
-    type: "line",
-    source: "safest",
-    layout: { "line-cap": "round", "line-join": "round" },
-    paint: { "line-color": "#4D86FF", "line-width": 5 },
-  });
+  // Routes on top, each one a bright line over a dark casing. Without the
+  // casing, a route crossing a hot segment takes on its colour and the eye
+  // loses the line exactly where the story is.
+  //
+  // Order matters: fastest at the bottom — it is the reference, not the answer
+  // — then the storm route, then the recommended walk, which nothing covers.
+  for (const [id, color, width, dashed] of [
+    ["shortest", FASTEST, 3, true],
+    ["rain", RAIN_ROUTE, 5, false],
+    ["safest", SAFEST, 5.5, false],
+  ] as const) {
+    m.addLayer({
+      id: `${id}-casing`,
+      type: "line",
+      source: id,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": CASING,
+        "line-width": width + 4,
+        "line-opacity": dashed ? 0.45 : 0.85,
+      },
+    });
+    m.addLayer({
+      id,
+      type: "line",
+      source: id,
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": color,
+        "line-width": width,
+        // The fastest line is deliberately recessive — it is the thing being
+        // argued against. Its dashes carry identity as well as its colour
+        // does, which is what lets it stay legible without competing.
+        "line-opacity": dashed ? 0.85 : 1,
+        ...(dashed ? { "line-dasharray": [1.5, 1.75] } : {}),
+      },
+    });
+  }
 }
+
+/**
+ * The same walk solved twice — once with the flood term off, once with it
+ * armed. Holding both at the same time is the only way to show that the
+ * weather changes the answer rather than just the wording.
+ */
+type Compare = { dry: RouteResponse; storm: RouteResponse };
 
 type Painted = {
   risk: unknown | null;
   flood: unknown | null;
   result: RouteResponse | null;
+  compare: Compare | null;
   heat: boolean;
   wet: boolean;
 };
@@ -236,11 +327,28 @@ function applyData(m: MapLibreMap, state: Painted) {
     m.setLayoutProperty(key, "visibility", on ? "visible" : "none");
   }
 
-  for (const key of ["shortest", "safest"] as const) {
+  // In compare mode the three lines mean: what your phone gives you, what we
+  // give you on a dry night, and what we give you in a storm. Out of it, the
+  // storm line is empty and it is the usual two.
+  const lines = state.compare
+    ? {
+        // The length-only search ignores the weather, so either response's
+        // shortest path is the same line. Take the armed one, because that is
+        // the one whose flooded-block count the panel quotes.
+        shortest: state.compare.storm.shortest.geometry,
+        safest: state.compare.dry.safest.geometry,
+        rain: state.compare.storm.safest.geometry,
+      }
+    : {
+        shortest: state.result?.shortest.geometry ?? null,
+        safest: state.result?.safest.geometry ?? null,
+        rain: null,
+      };
+
+  for (const key of ["shortest", "safest", "rain"] as const) {
+    const geometry = lines[key];
     (m.getSource(key) as GeoJSONSource).setData(
-      state.result
-        ? { type: "Feature", properties: {}, geometry: state.result[key].geometry }
-        : EMPTY,
+      geometry ? { type: "Feature", properties: {}, geometry } : EMPTY,
     );
   }
 }
@@ -277,6 +385,11 @@ export function MapDemo({
   const [fromText, setFromText] = useState("");
   const [toText, setToText] = useState("");
   const [result, setResult] = useState<RouteResponse | null>(null);
+  // Set only by the dry-vs-rain button. `mode` is what the routing effect
+  // dispatches on, so placing pins any other way drops back to a single route
+  // instead of silently re-running the comparison.
+  const [compare, setCompare] = useState<Compare | null>(null);
+  const [mode, setMode] = useState<"single" | "compare">("single");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [heat, setHeat] = useState(true);
@@ -315,6 +428,7 @@ export function MapDemo({
     risk: null,
     flood: null,
     result: null,
+    compare: null,
     heat: true,
     wet: false,
   });
@@ -496,6 +610,7 @@ export function MapDemo({
     const onClick = (e: MapMouseEvent) => {
       const p = { lat: e.lngLat.lat, lng: e.lngLat.lng };
       setError(null);
+      setMode("single");
       // First click sets the origin, second the destination, third starts over.
       setPins((prev) => {
         if (!prev.from) {
@@ -524,9 +639,11 @@ export function MapDemo({
     if (!m) return;
     for (const mk of markers.current) mk.remove();
     markers.current = [];
+    // Start is achromatic, destination is the safe-route green: the pin and the
+    // line that reaches it say the same thing.
     for (const [p, color] of [
       [from, "#FFFFFF"],
-      [to, "#4D86FF"],
+      [to, SAFEST],
     ] as const) {
       if (!p) continue;
       markers.current.push(
@@ -559,56 +676,126 @@ export function MapDemo({
   }, []);
 
   // --- routing -------------------------------------------------------------
-  // `rain` is a dependency, not a captured value: changing the override has to
-  // re-run the search, because it changes the cost function the router uses.
-  const run = useCallback(async (a: Point, b: Point) => {
-    setBusy(true);
-    setError(null);
-    setSaveMsg(null);
-    try {
+  const ask = useCallback(
+    async (a: Point, b: Point, wx: Rain): Promise<RouteResponse> => {
       const res = await fetch(
         `${ROUTER}/route?from_lat=${a.lat}&from_lng=${a.lng}` +
-          `&to_lat=${b.lat}&to_lng=${b.lng}&rain=${rain}`,
+          `&to_lat=${b.lat}&to_lng=${b.lng}&rain=${wx}`,
       );
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.detail ?? `router returned ${res.status}`);
       }
-      const data: RouteResponse = await res.json();
-      setResult(data);
-      setWeather(data.weather);
-      painted.current.result = data;
+      return res.json();
+    },
+    [],
+  );
 
-      const m = map.current;
-      if (!m) return;
-      applyData(m, painted.current);
+  /** Frame every line that is currently drawn, clear of the panel. */
+  const frame = useCallback((paths: Path[]) => {
+    const m = map.current;
+    const coords = paths.flatMap((p) => p.geometry.coordinates);
+    if (!m || !coords.length) return;
+    const first = coords[0] as [number, number];
+    const bounds = coords.reduce(
+      (acc, c) => acc.extend(c as [number, number]),
+      new LngLatBounds(first, first),
+    );
+    m.fitBounds(bounds, {
+      padding: { top: 80, bottom: 80, left: 440, right: 80 },
+      duration: 700,
+    });
+  }, []);
 
-      const coords = data.shortest.geometry.coordinates.concat(
-        data.safest.geometry.coordinates,
-      );
-      const first = coords[0] as [number, number];
-      const bounds = coords.reduce(
-        (acc, c) => acc.extend(c as [number, number]),
-        new LngLatBounds(first, first),
-      );
-      m.fitBounds(bounds, { padding: { top: 80, bottom: 80, left: 440, right: 80 }, duration: 700 });
-    } catch (e) {
-      setResult(null);
-      setError(
-        e instanceof Error && /fetch|network/i.test(e.message)
-          ? `Can't reach the routing service at ${ROUTER}. Start it with: python -m uvicorn backend.app.main:app --port 8000`
-          : e instanceof Error
-            ? e.message
-            : "Routing failed.",
-      );
-    } finally {
-      setBusy(false);
-    }
-  }, [rain]);
+  const explain = useCallback(
+    (e: unknown) =>
+      e instanceof Error && /fetch|network/i.test(e.message)
+        ? `Can't reach the routing service at ${ROUTER}. Start it with: python -m uvicorn backend.app.main:app --port 8000`
+        : e instanceof Error
+          ? e.message
+          : "Routing failed.",
+    [],
+  );
+
+  // `rain` is a dependency, not a captured value: changing the override has to
+  // re-run the search, because it changes the cost function the router uses.
+  const run = useCallback(
+    async (a: Point, b: Point) => {
+      setBusy(true);
+      setError(null);
+      setSaveMsg(null);
+      try {
+        const data = await ask(a, b, rain);
+        setResult(data);
+        setCompare(null);
+        setWeather(data.weather);
+        painted.current.result = data;
+        painted.current.compare = null;
+
+        if (!map.current) return;
+        applyData(map.current, painted.current);
+        frame([data.shortest, data.safest]);
+      } catch (e) {
+        setResult(null);
+        setError(explain(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [rain, ask, frame, explain],
+  );
+
+  /**
+   * The same two points, solved under both weathers at once.
+   *
+   * Both searches are asked for explicitly rather than read off the live gate:
+   * the whole point is to show the dry answer and the storm answer side by
+   * side, which is impossible if the weather has to actually change first. The
+   * flood layer is switched on because the storm line is unreadable without the
+   * hazard it is bending around.
+   */
+  const runCompare = useCallback(
+    async (a: Point, b: Point) => {
+      setBusy(true);
+      setError(null);
+      setSaveMsg(null);
+      try {
+        const [dry, storm] = await Promise.all([
+          ask(a, b, "off"),
+          ask(a, b, "on"),
+        ]);
+        const pair = { dry, storm };
+        setCompare(pair);
+        // The storm answer is the one a walk would start from, so the rest of
+        // the panel keeps working off it.
+        setResult(storm);
+        // Deliberately *not* setWeather(storm.weather). That snapshot has every
+        // borough armed because the request forced it, and writing it into the
+        // panel would make the gate claim it is raining outside right now. The
+        // storm route is a simulation; the gate keeps reporting the real sky.
+        setWet(true);
+        painted.current.compare = pair;
+        painted.current.result = storm;
+
+        if (!map.current) return;
+        applyData(map.current, painted.current);
+        frame([dry.shortest, dry.safest, storm.safest]);
+      } catch (e) {
+        setCompare(null);
+        setResult(null);
+        setError(explain(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [ask, frame, explain],
+  );
 
   useEffect(() => {
-    if (from && to) void run(from, to);
-  }, [from, to, run]);
+    if (!from || !to) return;
+    if (mode === "compare") void runCompare(from, to);
+    else void run(from, to);
+  }, [from, to, mode, run, runCompare]);
 
   // --- address search ------------------------------------------------------
   const geocode = useCallback(async (q: string): Promise<Point> => {
@@ -631,6 +818,7 @@ export function MapDemo({
       // second and it will start refusing if we fan out.
       const a = await geocode(fromText.trim());
       const b = await geocode(toText.trim());
+      setMode("single");
       setPins({ from: a, to: b });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Address lookup failed.");
@@ -643,10 +831,24 @@ export function MapDemo({
     setFromText("");
     setToText("");
     setResult(null);
+    setCompare(null);
+    setMode("single");
     setError(null);
     setSaveMsg(null);
     painted.current.result = null;
+    painted.current.compare = null;
     if (map.current) applyData(map.current, painted.current);
+  };
+
+  /** The saved storm walk: load it and solve it under both weathers at once. */
+  const runStormDemo = () => {
+    setSaveMsg(null);
+    setError(null);
+    setFromText(STORM.fromText);
+    setToText(STORM.toText);
+    setHeat(true);
+    setMode("compare");
+    setPins({ from: STORM.from, to: STORM.to });
   };
 
   // --- saved walks ---------------------------------------------------------
@@ -914,6 +1116,7 @@ export function MapDemo({
     setSaveMsg(null);
     setFromText("");
     setToText("");
+    setMode("single");
     // Re-routed rather than replayed from the stored geometry, on purpose: the
     // scores and the weather have both moved on since it was saved, and the
     // honest answer is today's safest walk between the same two points.
@@ -925,6 +1128,22 @@ export function MapDemo({
 
   const extra = result
     ? Math.round(result.safest.distance_m - result.shortest.distance_m)
+    : 0;
+
+  // What the dry-vs-rain readout is actually claiming. `shift` is the only one
+  // that compares the two recommendations to each other; the rest compare each
+  // recommendation to the fastest walk under its own weather.
+  const dryExtra = compare
+    ? Math.round(compare.dry.safest.distance_m - compare.dry.shortest.distance_m)
+    : 0;
+  const stormExtra = compare
+    ? Math.round(compare.storm.safest.distance_m - compare.storm.shortest.distance_m)
+    : 0;
+  const stormAvoided = compare
+    ? compare.storm.shortest.flooded_segments - compare.storm.safest.flooded_segments
+    : 0;
+  const shift = compare
+    ? Math.round(compare.storm.safest.distance_m - compare.dry.safest.distance_m)
     : 0;
 
   // What the gate is doing, in one sentence.
@@ -1038,7 +1257,89 @@ export function MapDemo({
             </p>
           )}
 
-          {result && (
+          {compare && (
+            <>
+              <p className="mt-5 text-[17px] leading-[1.45] font-medium text-pretty">
+                Same walk, two weathers — and the answer moves.
+              </p>
+
+              <dl className="mt-4 flex flex-col gap-2.5">
+                {(
+                  [
+                    [
+                      "fastest",
+                      "Fastest",
+                      FASTEST,
+                      true,
+                      compare.storm.shortest,
+                      `${compare.storm.shortest.flooded_segments} flooded · ${compare.storm.shortest.risky_segments} crash`,
+                    ],
+                    [
+                      "dry",
+                      "Dry",
+                      SAFEST,
+                      false,
+                      compare.dry.safest,
+                      `${dryExtra >= 0 ? "+" : ""}${dryExtra} m`,
+                    ],
+                    [
+                      "rain",
+                      "In rain",
+                      RAIN_ROUTE,
+                      false,
+                      compare.storm.safest,
+                      `${stormExtra >= 0 ? "+" : ""}${stormExtra} m · ${compare.storm.safest.flooded_segments} flooded`,
+                    ],
+                  ] as const
+                ).map(([key, label, color, dashed, p, note]) => (
+                  <div key={key} className="flex items-center gap-3">
+                    <span
+                      aria-hidden
+                      className="h-[3px] w-6 shrink-0 rounded-full"
+                      style={
+                        dashed
+                          ? {
+                              background: `repeating-linear-gradient(90deg,${color} 0 4px,transparent 4px 7px)`,
+                            }
+                          : { background: color }
+                      }
+                    />
+                    <dt className="w-[62px] text-[14px] text-white/70">{label}</dt>
+                    <dd className="text-[14px] tabular-nums text-white">
+                      {(p.distance_m / 1000).toFixed(2)} km
+                      <span className="ml-2 text-white/45">{note}</span>
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+
+              <div className="mt-3 flex flex-col gap-1.5 text-[13px] leading-[1.55]">
+                <p className="text-white/45">
+                  <span style={{ color: SAFEST }}>Dry</span> — {compare.dry.reason}
+                </p>
+                <p className="text-white/45">
+                  <span style={{ color: RAIN_ROUTE }}>In rain</span> —{" "}
+                  {compare.storm.reason}
+                </p>
+              </div>
+
+              <p className="mt-3 text-[13px] leading-[1.55] text-white/60">
+                {stormAvoided > 0
+                  ? `Rain moves the route ${Math.abs(shift)} m and takes you off ` +
+                    `${stormAvoided} block${stormAvoided === 1 ? "" : "s"} FloodNet has ` +
+                    `measured underwater. Dry, none of that costs you anything — ` +
+                    `the flood term contributes exactly zero.`
+                  : `Rain moves the route ${Math.abs(shift)} m on this pair.`}
+              </p>
+
+              <p className="mt-2 text-[12px] leading-[1.5] text-white/35">
+                Both lines were solved just now, with the flood term forced off
+                and then on. The live gate below still reports the real sky.
+              </p>
+            </>
+          )}
+
+          {result && !compare && (
             <>
               <p className="mt-5 text-[17px] leading-[1.45] font-medium text-pretty">
                 {result.reason}
@@ -1047,15 +1348,21 @@ export function MapDemo({
               <dl className="mt-4 flex flex-col gap-2.5">
                 {(
                   [
-                    ["safest", "Safest", "#4D86FF", result.safest],
-                    ["shortest", "Shortest", "#FFFFFF", result.shortest],
+                    ["safest", "Safest", SAFEST, false, result.safest],
+                    ["shortest", "Fastest", FASTEST, true, result.shortest],
                   ] as const
-                ).map(([key, label, color, p]) => (
+                ).map(([key, label, color, dashed, p]) => (
                   <div key={key} className="flex items-center gap-3">
                     <span
                       aria-hidden
                       className="h-[3px] w-6 shrink-0 rounded-full"
-                      style={{ background: color }}
+                      style={
+                        dashed
+                          ? {
+                              background: `repeating-linear-gradient(90deg,${color} 0 4px,transparent 4px 7px)`,
+                            }
+                          : { background: color }
+                      }
                     />
                     <dt className="w-[62px] text-[14px] text-white/70">{label}</dt>
                     <dd className="text-[14px] tabular-nums text-white">
@@ -1073,28 +1380,28 @@ export function MapDemo({
                   ? "No detour needed on this trip."
                   : `About ${extra} m further — roughly ${Math.max(1, Math.round(extra / 80))} min of extra walking.`}
               </p>
-
-              {saved && (
-                <div className="mt-4 flex items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={save}
-                    disabled={pending}
-                    className="rounded-lg border border-white/25 px-3.5 py-2 text-[13px] font-medium text-white transition-colors hover:border-white/60 disabled:opacity-40"
-                  >
-                    {pending ? "Saving…" : "Save this walk"}
-                  </button>
-                  {saveMsg && (
-                    <span
-                      role="status"
-                      className={`text-[13px] ${saveMsg === "Saved." ? "text-white/45" : "text-[#FF8A80]"}`}
-                    >
-                      {saveMsg}
-                    </span>
-                  )}
-                </div>
-              )}
             </>
+          )}
+
+          {result && saved && (
+            <div className="mt-4 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={save}
+                disabled={pending}
+                className="rounded-lg border border-white/25 px-3.5 py-2 text-[13px] font-medium text-white transition-colors hover:border-white/60 disabled:opacity-40"
+              >
+                {pending ? "Saving…" : "Save this walk"}
+              </button>
+              {saveMsg && (
+                <span
+                  role="status"
+                  className={`text-[13px] ${saveMsg === "Saved." ? "text-white/45" : "text-[#FF8A80]"}`}
+                >
+                  {saveMsg}
+                </span>
+              )}
+            </div>
           )}
 
           {/* The safety loop — only where there is an account to consent */}
@@ -1293,6 +1600,39 @@ export function MapDemo({
             </div>
           )}
 
+          {/* What each line on the map means. Colour alone never carries it:
+              every line is named, and the fastest one is dashed as well. */}
+          <div className="mt-5 border-t border-white/10 pt-4">
+            <h2 className="text-[14px] font-medium">On the map</h2>
+            <ul className="mt-2.5 flex flex-col gap-2">
+              {(
+                [
+                  [SAFEST, false, "Safest walk", "risk-weighted A*"],
+                  [FASTEST, true, "Fastest walk", "distance only — your phone"],
+                  [RAIN_ROUTE, false, "Safest in rain", "flood term armed"],
+                  [CRASH_RAMP[3], false, "Crash risk", "darker red = lower"],
+                  [FLOOD_RAMP[2], false, "Street flooding", "darker blue = lower"],
+                ] as const
+              ).map(([color, dashed, label, note]) => (
+                <li key={label} className="flex items-center gap-3">
+                  <span
+                    aria-hidden
+                    className="h-[3px] w-6 shrink-0 rounded-full"
+                    style={
+                      dashed
+                        ? {
+                            background: `repeating-linear-gradient(90deg,${color} 0 4px,transparent 4px 7px)`,
+                          }
+                        : { background: color }
+                    }
+                  />
+                  <span className="text-[13px] text-white">{label}</span>
+                  <span className="text-[12px] text-white/40">{note}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+
           {/* Heatmap control + legend */}
           <div className="mt-5 border-t border-white/10 pt-4">
             <label className="flex cursor-pointer items-center justify-between gap-3">
@@ -1301,7 +1641,8 @@ export function MapDemo({
                 type="checkbox"
                 checked={heat}
                 onChange={(e) => setHeat(e.target.checked)}
-                className="h-4 w-4 accent-[#4D86FF]"
+                className="h-4 w-4"
+                style={{ accentColor: CRASH_RAMP[3] }}
               />
             </label>
 
@@ -1311,8 +1652,7 @@ export function MapDemo({
                   aria-hidden
                   className="mt-3 h-1.5 w-full rounded-full"
                   style={{
-                    background:
-                      "linear-gradient(90deg,#2E5A88,#3F9BD9,#F5C518,#FF6319,#EE352E)",
+                    background: `linear-gradient(90deg,${CRASH_RAMP.join(",")})`,
                   }}
                 />
                 <div className="mt-1.5 flex justify-between font-mono text-[10px] tracking-wider text-white/40 uppercase">
@@ -1333,7 +1673,8 @@ export function MapDemo({
                 type="checkbox"
                 checked={wet}
                 onChange={(e) => setWet(e.target.checked)}
-                className="h-4 w-4 accent-[#22D3EE]"
+                className="h-4 w-4"
+                style={{ accentColor: FLOOD_RAMP[2] }}
               />
             </label>
 
@@ -1342,7 +1683,7 @@ export function MapDemo({
                 <div
                   aria-hidden
                   className="mt-3 h-1.5 w-full rounded-full"
-                  style={{ background: "linear-gradient(90deg,#0E4F63,#22D3EE,#A5F3FC)" }}
+                  style={{ background: `linear-gradient(90deg,${FLOOD_RAMP.join(",")})` }}
                 />
                 <div className="mt-1.5 flex justify-between font-mono text-[10px] tracking-wider text-white/40 uppercase">
                   <span>Lower</span>
@@ -1377,7 +1718,13 @@ export function MapDemo({
                     key={value}
                     type="button"
                     aria-pressed={rain === value}
-                    onClick={() => setRain(value)}
+                    onClick={() => {
+                      // Overriding the weather by hand is a single-route
+                      // question, so it drops out of the two-line comparison
+                      // rather than silently re-solving it underneath.
+                      setMode("single");
+                      setRain(value);
+                    }}
                     className={`px-3 py-1.5 text-[12px] font-medium transition-colors ${
                       rain === value
                         ? "bg-white text-black"
@@ -1402,16 +1749,29 @@ export function MapDemo({
             )}
           </div>
 
-          <button
-            onClick={() => {
-              setFromText(PRESET.fromText);
-              setToText(PRESET.toText);
-              setPins({ from: PRESET.from, to: PRESET.to });
-            }}
-            className="mt-4 rounded-lg border border-white/25 px-4 py-2.5 text-[13px] font-medium text-white transition-colors hover:border-white/60"
-          >
-            Try {PRESET.label}
-          </button>
+          <div className="mt-4 flex flex-col gap-2">
+            <button
+              onClick={() => {
+                setMode("single");
+                setFromText(PRESET.fromText);
+                setToText(PRESET.toText);
+                setPins({ from: PRESET.from, to: PRESET.to });
+              }}
+              className="rounded-lg border border-white/25 px-4 py-2.5 text-[13px] font-medium text-white transition-colors hover:border-white/60"
+            >
+              Try {PRESET.label}
+            </button>
+            <button
+              onClick={runStormDemo}
+              disabled={busy}
+              className="rounded-lg border px-4 py-2.5 text-[13px] font-medium transition-colors disabled:opacity-40"
+              style={{ borderColor: `${RAIN_ROUTE}66`, color: RAIN_ROUTE }}
+            >
+              {busy && mode === "compare"
+                ? "Solving both…"
+                : `Dry vs rain — ${STORM.label}`}
+            </button>
+          </div>
 
           {/* Saved walks — only rendered where there is a session to own them */}
           {saved && (
