@@ -7,6 +7,7 @@ import {
   Map as MapLibreMap,
   Marker,
   NavigationControl,
+  setWorkerUrl,
   type MapMouseEvent,
 } from "maplibre-gl";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -14,6 +15,15 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import { Wordmark } from "@/components/ui/wordmark";
 
 const ROUTER = process.env.NEXT_PUBLIC_ROUTER_URL ?? "http://127.0.0.1:8000";
+
+// Next's Turbopack bundle gives MapLibre a non-HTTP `import.meta.url`, so
+// MapLibre 6 cannot derive its sibling worker module and falls back to
+// `new Worker("")`. That loads this page as HTML and leaves every vector and
+// GeoJSON source unprocessed. Pin the worker to the installed MapLibre version
+// before the first map is constructed.
+setWorkerUrl(
+  "https://unpkg.com/maplibre-gl@6.3.0/dist/maplibre-gl-worker.mjs",
+);
 
 // Carto's dark basemap: no token, and it leaves the routes and the heatmap as
 // the only bright things on screen, which is the whole point of the view.
