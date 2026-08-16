@@ -117,20 +117,4 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=...
 SUPABASE_SERVICE_ROLE_KEY=...
 ```
 
----
 
-## Status
-
-- [x] Crash data profiled and understood
-- [x] Technical plan written
-- [ ] Street graph loaded into Supabase
-- [ ] `crash_risk` computed per segment
-- [ ] Two-route comparison in the UI ← *the demo moment*
-- [ ] Flood sensor geocoding
-- [ ] Open-Meteo integration
-
-> **Protect one thing:** finish the two-route comparison early. Crashes alone make a complete, defensible project; flood and weather make it better.
-
----
-
-*Built for a hackathon. Crash and flood layers use real NYC Open Data.*
