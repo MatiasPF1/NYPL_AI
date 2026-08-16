@@ -1,12 +1,13 @@
 fastapi
 uvicorn[standard]
 python-dotenv
-httpx
+httpx              # geocoder proxy + Open-Meteo
+networkx           # A* over the road graph
+pandas             # the prep + scoring pipelines
+psycopg2-binary    # direct Postgres connection (the graph is not in the API)
+osmnx              # street graph download
 
-# Phase 1+ — uncomment as each phase lands
-# networkx          # A* over the road graph
-# pandas            # the prep + scoring pipelines
-# osmnx             # street graph download
+# Later phases — uncomment as each lands
 # supabase          # service-key client
 # langgraph         # agent orchestration (phase 7)
 # anthropic         # intent parsing + explanation (phase 7)

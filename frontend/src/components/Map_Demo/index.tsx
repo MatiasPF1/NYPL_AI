@@ -14,9 +14,40 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { deleteRoute, saveRoute, type SavedRoute } from "@/components/Map_Demo/actions";
+import {
+  grantConsent,
+  raiseAlert,
+  revokeConsent,
+  type AlertKind,
+  type Consent,
+} from "@/components/Map_Demo/safety";
 import { Wordmark } from "@/components/ui/wordmark";
+import { metresBetween, metresFromPath, offsetMetres, type LngLat } from "@/lib/geo";
+import { createClient } from "@/lib/supabase/client";
 
 const ROUTER = process.env.NEXT_PUBLIC_ROUTER_URL ?? "http://127.0.0.1:8000";
+
+// --- the safety loop's constants ------------------------------------------
+// One joystick press. About eight paces — small enough to steer with, big
+// enough that leaving the route takes a deliberate few taps rather than one.
+const STEP_M = 20;
+// How far off the recommended line counts as "off it". Comfortably wider than
+// a city block's worth of GPS wobble, so crossing to the other pavement is not
+// a departure.
+const OFF_PATH_M = 50;
+// …and for how long. This is the number that stops a single GPS jump — the
+// kind that happens every time you walk past a tall building — from firing an
+// alert. Being 60 m off for one reading is noise; being 60 m off for ten
+// seconds is a wrong turn.
+const SUSTAINED_MS = 10_000;
+// Within this of the destination, the walk is over.
+const ARRIVE_M = 40;
+// The detector re-checks on a timer as well as on movement, so standing still
+// in the wrong place still raises an alert.
+const TICK_MS = 2_000;
+// Live positions are written to the database at most this often. A trip is a
+// few dozen rows, not a few thousand.
+const WRITE_EVERY_MS = 4_000;
 
 // Next's Turbopack bundle gives MapLibre a non-HTTP `import.meta.url`, so
 // MapLibre 6 cannot derive its sibling worker module and falls back to
@@ -214,17 +245,27 @@ function applyData(m: MapLibreMap, state: Painted) {
   }
 }
 
+type Trip = { routeId: string | null; path: LngLat[]; dest: LngLat };
+type Fired = { id: number; kind: AlertKind; at: number; delivery: string; detail?: string };
+
 export function MapDemo({
   account,
   saved,
+  consent,
+  userId,
+  defaultEmail,
 }: {
   account?: React.ReactNode;
   /** Present only on /app, where there is a session to own them. */
   saved?: SavedRoute[];
+  consent?: Consent | null;
+  userId?: string;
+  defaultEmail?: string;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const map = useRef<MapLibreMap | null>(null);
   const markers = useRef<Marker[]>([]);
+  const liveMarker = useRef<Marker | null>(null);
   const router = useRouter();
 
   const [ready, setReady] = useState(false);
@@ -246,6 +287,27 @@ export function MapDemo({
   const [weather, setWeather] = useState<Weather | null>(null);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
+
+  // --- the walk in progress ------------------------------------------------
+  const [trip, setTrip] = useState<Trip | null>(null);
+  const [pos, setPos] = useState<LngLat | null>(null);
+  const [offBy, setOffBy] = useState(0);
+  const [fired, setFired] = useState<Fired[]>([]);
+  const [tripMsg, setTripMsg] = useState<string | null>(null);
+  const [gps, setGps] = useState(false);
+  const [alertEmail, setAlertEmail] = useState(defaultEmail ?? "");
+  const [phone, setPhone] = useState("");
+  const [authorised, setAuthorised] = useState(false);
+  const [consentMsg, setConsentMsg] = useState<string | null>(null);
+
+  // Detector state lives in refs: the timer and the keyboard handler are
+  // registered once and would otherwise compare against a stale position.
+  const tripRef = useRef<Trip | null>(null);
+  const posRef = useRef<LngLat | null>(null);
+  const offSince = useRef<number | null>(null);
+  const alerted = useRef(false);
+  const lastWrite = useRef(0);
+  const watchId = useRef<number | null>(null);
   // Mirrors of the map's data, so it can be replayed after a style swap
   // destroys every source. Refs, not state: the map listeners that read this
   // are registered once and would otherwise close over stale values.
@@ -473,6 +535,29 @@ export function MapDemo({
     }
   }, [from, to]);
 
+  // --- the live position marker -------------------------------------------
+  useEffect(() => {
+    const m = map.current;
+    if (!m) return;
+    if (!pos) {
+      liveMarker.current?.remove();
+      liveMarker.current = null;
+      return;
+    }
+    if (!liveMarker.current) {
+      liveMarker.current = new Marker({ color: "#22C55E" }).setLngLat(pos).addTo(m);
+    } else {
+      liveMarker.current.setLngLat(pos);
+    }
+  }, [pos]);
+
+  useEffect(() => {
+    return () => {
+      liveMarker.current?.remove();
+      liveMarker.current = null;
+    };
+  }, []);
+
   // --- routing -------------------------------------------------------------
   // `rain` is a dependency, not a captured value: changing the override has to
   // re-run the search, because it changes the cost function the router uses.
@@ -593,6 +678,237 @@ export function MapDemo({
       else setSaveMsg(res.error);
     });
   };
+
+  // --- the safety loop -----------------------------------------------------
+  const fire = useCallback(
+    (kind: AlertKind, at: LngLat, offByM?: number) => {
+      // Read now, not inside the transition: arrival ends the walk immediately
+      // and would clear the trip out from under the async call, filing the
+      // alert against no route at all.
+      const routeId = tripRef.current?.routeId ?? null;
+      startTransition(async () => {
+        const res = await raiseAlert({
+          kind,
+          routeId,
+          lat: at[1],
+          lng: at[0],
+          offByM: offByM ?? null,
+        });
+        setFired((prev) => [
+          {
+            id: Date.now(),
+            kind,
+            at: Date.now(),
+            delivery: res.ok ? res.delivery : "failed",
+            detail: res.ok ? res.detail : res.error,
+          },
+          ...prev,
+        ]);
+      });
+    },
+    [],
+  );
+
+  const stopWalk = useCallback((announce = true) => {
+    tripRef.current = null;
+    setTrip(null);
+    setPos(null);
+    posRef.current = null;
+    setOffBy(0);
+    offSince.current = null;
+    alerted.current = false;
+    if (watchId.current !== null) {
+      navigator.geolocation.clearWatch(watchId.current);
+      watchId.current = null;
+    }
+    setGps(false);
+    if (announce) setTripMsg("Tracking stopped.");
+  }, []);
+
+  /** One position update: store it, judge it, and act if it has gone on too long. */
+  const observe = useCallback(
+    (p: LngLat) => {
+      const t = tripRef.current;
+      posRef.current = p;
+      setPos(p);
+      if (!t) return;
+
+      const away = metresFromPath(p, t.path);
+      setOffBy(away);
+
+      // Persist the track. Throttled — the detector runs on every update, but
+      // the database does not need a row for each one.
+      const now = Date.now();
+      if (userId && now - lastWrite.current > WRITE_EVERY_MS) {
+        lastWrite.current = now;
+        void createClient()
+          .from("locations")
+          .insert({
+            user_id: userId,
+            route_id: t.routeId,
+            lat: p[1],
+            lng: p[0],
+          })
+          .then(({ error }) => {
+            // Not surfaced in the panel — a dropped position is not something
+            // the walker can act on — but never swallowed either, because a
+            // policy that rejects every write would otherwise look identical
+            // to a walk that recorded fine.
+            if (error) console.warn("[SafeNYC] location not recorded:", error.message);
+          });
+      }
+
+      if (metresBetween(p, t.dest) <= ARRIVE_M) {
+        fire("arrived", p);
+        setTripMsg("Arrived. Tracking stopped.");
+        stopWalk(false);
+        return;
+      }
+
+      if (away > OFF_PATH_M) {
+        // Sustained, not instantaneous: the clock starts on the first reading
+        // off the line and only an unbroken run of them raises anything.
+        if (offSince.current === null) offSince.current = now;
+        if (!alerted.current && now - offSince.current >= SUSTAINED_MS) {
+          alerted.current = true;
+          fire("deviation", p, away);
+        }
+      } else {
+        // Back on the route: reset, so a second departure alerts again.
+        offSince.current = null;
+        alerted.current = false;
+      }
+    },
+    [userId, fire, stopWalk],
+  );
+
+  const startWalk = () => {
+    if (!result || !from || !to) return;
+    if (!consent?.consentedAt) {
+      setTripMsg("Authorise location tracking first.");
+      return;
+    }
+    const path = result.safest.geometry.coordinates as LngLat[];
+    if (path.length < 2) return;
+
+    setTripMsg(null);
+    setFired([]);
+    startTransition(async () => {
+      // A walk is always tied to a stored route: it is what the live positions
+      // and any alert hang off, and what Phase D compares against later.
+      const res = await saveRoute({
+        name:
+          fromText.trim() && toText.trim()
+            ? `${fromText.trim()} → ${toText.trim()}`
+            : `Walk at ${new Date().toLocaleTimeString()}`,
+        origin: from,
+        dest: to,
+        coordinates: path,
+        distanceM: result.safest.distance_m,
+        riskExposure: result.safest.risk_exposure,
+      });
+      const t: Trip = {
+        routeId: res.ok ? res.id : null,
+        path,
+        dest: path[path.length - 1],
+      };
+      tripRef.current = t;
+      setTrip(t);
+      lastWrite.current = 0;
+      observe(path[0]);
+      router.refresh();
+      if (!res.ok) setTripMsg("Walking without saving — " + res.error);
+    });
+  };
+
+  /** Joystick: one press, one step, in metres rather than degrees. */
+  const step = (east: number, north: number) => {
+    const p = posRef.current;
+    if (!p || !tripRef.current) return;
+    observe(offsetMetres(p, east * STEP_M, north * STEP_M));
+  };
+
+  const toggleGps = () => {
+    if (!trip) return;
+    if (watchId.current !== null) {
+      navigator.geolocation.clearWatch(watchId.current);
+      watchId.current = null;
+      setGps(false);
+      return;
+    }
+    if (!navigator.geolocation) {
+      setTripMsg("This browser has no geolocation.");
+      return;
+    }
+    // The browser asks its own permission on top of the consent already on
+    // file. Both have to say yes; neither substitutes for the other.
+    watchId.current = navigator.geolocation.watchPosition(
+      (p) => observe([p.coords.longitude, p.coords.latitude]),
+      (err) => {
+        setTripMsg(`Location unavailable: ${err.message}`);
+        setGps(false);
+      },
+      { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 },
+    );
+    setGps(true);
+  };
+
+  const saveConsent = () => {
+    setConsentMsg(null);
+    startTransition(async () => {
+      const res = await grantConsent({ email: alertEmail, phone, authorised });
+      if (res.ok) {
+        setPhone("");
+        setAuthorised(false);
+        router.refresh();
+      } else {
+        setConsentMsg(res.error);
+      }
+    });
+  };
+
+  const stopSharing = () => {
+    startTransition(async () => {
+      stopWalk(false);
+      const res = await revokeConsent();
+      if (res.ok) router.refresh();
+      else setConsentMsg(res.error);
+    });
+  };
+
+  // The detector on a clock, not only on movement: standing still 80 m off the
+  // route is exactly the case that should raise an alert, and no position
+  // update would ever arrive to trigger it.
+  useEffect(() => {
+    if (!trip) return;
+    const id = window.setInterval(() => {
+      if (posRef.current) observe(posRef.current);
+    }, TICK_MS);
+    return () => window.clearInterval(id);
+  }, [trip, observe]);
+
+  // Arrow keys drive the joystick, so the walk can be steered without hunting
+  // for four small buttons mid-demo.
+  useEffect(() => {
+    if (!trip) return;
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA)$/.test(target.tagName)) return;
+      const moves: Record<string, [number, number]> = {
+        ArrowUp: [0, 1],
+        ArrowDown: [0, -1],
+        ArrowLeft: [-1, 0],
+        ArrowRight: [1, 0],
+      };
+      const move = moves[e.key];
+      if (!move) return;
+      e.preventDefault();
+      const p = posRef.current;
+      if (p) observe(offsetMetres(p, move[0] * STEP_M, move[1] * STEP_M));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [trip, observe]);
 
   const load = (r: SavedRoute) => {
     setSaveMsg(null);
@@ -779,6 +1095,202 @@ export function MapDemo({
                 </div>
               )}
             </>
+          )}
+
+          {/* The safety loop — only where there is an account to consent */}
+          {consent !== undefined && (
+            <div className="mt-5 border-t border-white/10 pt-4">
+              <h2 className="text-[14px] font-medium">Walk with me</h2>
+
+              {!consent?.consentedAt ? (
+                <>
+                  <p className="mt-2 text-[12px] leading-[1.5] text-white/40">
+                    To follow your walk and raise the alarm if you leave the safe
+                    route, SafeNYC needs somewhere to send alerts and your
+                    say-so. Both stay on your account, and you can withdraw
+                    either at any time.
+                  </p>
+                  <input
+                    value={alertEmail}
+                    onChange={(e) => setAlertEmail(e.target.value)}
+                    inputMode="email"
+                    autoComplete="email"
+                    placeholder="Where alerts go — an email address"
+                    className={`${field} mt-3`}
+                  />
+                  <input
+                    value={phone}
+                    onChange={(e) => setPhone(e.target.value)}
+                    inputMode="tel"
+                    placeholder="Mobile (optional) — kept for when SMS is enabled"
+                    className={`${field} mt-2`}
+                  />
+                  <label className="mt-3 flex cursor-pointer items-start gap-2.5">
+                    <input
+                      type="checkbox"
+                      checked={authorised}
+                      onChange={(e) => setAuthorised(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 shrink-0 accent-[#22C55E]"
+                    />
+                    <span className="text-[12px] leading-[1.5] text-white/70">
+                      I authorise SafeNYC to record my location while a walk is
+                      active, and to email this address if I leave the route or
+                      press SOS.
+                    </span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={saveConsent}
+                    disabled={pending || !alertEmail.trim() || !authorised}
+                    className="mt-3 rounded-lg bg-white px-4 py-2.5 text-[13px] font-medium text-black transition-opacity hover:opacity-85 disabled:opacity-40"
+                  >
+                    {pending ? "Saving…" : "Authorise tracking"}
+                  </button>
+                  {consentMsg && (
+                    <p role="alert" className="mt-2 text-[12px] text-[#FF8A80]">
+                      {consentMsg}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p className="mt-2 text-[12px] leading-[1.5] text-white/40">
+                    Alerts go to {consent.email}.{" "}
+                    {consent.ready
+                      ? "Email is live."
+                      : "Email isn't configured yet — alerts will be recorded but not sent."}{" "}
+                    <button
+                      type="button"
+                      onClick={stopSharing}
+                      disabled={pending}
+                      className="underline underline-offset-2 transition-colors hover:text-white disabled:opacity-40"
+                    >
+                      Stop sharing
+                    </button>
+                  </p>
+
+                  {!trip ? (
+                    <button
+                      type="button"
+                      onClick={startWalk}
+                      disabled={pending || !result}
+                      className="mt-3 rounded-lg bg-[#22C55E] px-4 py-2.5 text-[13px] font-medium text-black transition-opacity hover:opacity-85 disabled:opacity-40"
+                    >
+                      {result ? "Start this walk" : "Find a route first"}
+                    </button>
+                  ) : (
+                    <>
+                      <div className="mt-3 flex items-start gap-4">
+                        {/* Four-way joystick. Arrow keys do the same thing. */}
+                        <div className="grid shrink-0 grid-cols-3 gap-1">
+                          {(
+                            [
+                              ["", 0, 0], ["↑", 0, 1], ["", 0, 0],
+                              ["←", -1, 0], ["", 0, 0], ["→", 1, 0],
+                              ["", 0, 0], ["↓", 0, -1], ["", 0, 0],
+                            ] as const
+                          ).map(([label, east, north], i) =>
+                            label ? (
+                              <button
+                                key={i}
+                                type="button"
+                                aria-label={
+                                  { "↑": "north", "↓": "south", "←": "west", "→": "east" }[label]
+                                }
+                                onClick={() => step(east, north)}
+                                className="h-9 w-9 rounded-lg border border-white/20 text-[15px] text-white transition-colors hover:border-white/60 active:bg-white/15"
+                              >
+                                {label}
+                              </button>
+                            ) : (
+                              <span key={i} className="h-9 w-9" />
+                            ),
+                          )}
+                        </div>
+
+                        <div className="min-w-0 flex-1">
+                          <p className="text-[13px] leading-[1.5] text-white">
+                            {offBy > OFF_PATH_M ? (
+                              <span className="text-[#F5C518]">
+                                {Math.round(offBy)} m off route
+                              </span>
+                            ) : (
+                              <>On route · {Math.round(offBy)} m from the line</>
+                            )}
+                          </p>
+                          <p className="mt-1 text-[12px] leading-[1.5] text-white/40">
+                            {STEP_M} m a press, or use the arrow keys. An alert
+                            fires after {SUSTAINED_MS / 1000}s more than{" "}
+                            {OFF_PATH_M} m off.
+                          </p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => posRef.current && fire("sos", posRef.current)}
+                              disabled={pending}
+                              className="rounded-lg bg-[#EE352E] px-3 py-1.5 text-[12px] font-medium text-white transition-opacity hover:opacity-85 disabled:opacity-40"
+                            >
+                              SOS
+                            </button>
+                            <button
+                              type="button"
+                              onClick={toggleGps}
+                              className={`rounded-lg border px-3 py-1.5 text-[12px] font-medium transition-colors ${
+                                gps
+                                  ? "border-[#22C55E] text-[#22C55E]"
+                                  : "border-white/25 text-white hover:border-white/60"
+                              }`}
+                            >
+                              {gps ? "Using real GPS" : "Use real GPS"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => stopWalk()}
+                              className="rounded-lg border border-white/25 px-3 py-1.5 text-[12px] font-medium text-white transition-colors hover:border-white/60"
+                            >
+                              End walk
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  )}
+
+                  {tripMsg && (
+                    <p className="mt-2 text-[12px] leading-[1.5] text-white/45">{tripMsg}</p>
+                  )}
+
+                  {fired.length > 0 && (
+                    <ul className="mt-3 flex flex-col gap-1.5">
+                      {fired.map((a) => (
+                        <li key={a.id} className="text-[12px] leading-[1.5]">
+                          <span
+                            className={
+                              a.kind === "sos"
+                                ? "text-[#FF8A80]"
+                                : a.kind === "arrived"
+                                  ? "text-[#22C55E]"
+                                  : "text-[#F5C518]"
+                            }
+                          >
+                            {a.kind}
+                          </span>
+                          <span className="text-white/40">
+                            {" "}
+                            · {new Date(a.at).toLocaleTimeString()} ·{" "}
+                            {a.delivery === "sent"
+                              ? "emailed"
+                              : a.delivery === "not_configured"
+                                ? "recorded, email not configured"
+                                : `recorded, not sent${a.detail ? ` (${a.detail})` : ""}`}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              )}
+            </div>
           )}
 
           {/* Heatmap control + legend */}

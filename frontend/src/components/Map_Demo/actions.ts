@@ -39,6 +39,7 @@ export type SaveInput = {
 };
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
+export type SaveResult = { ok: true; id: string } | { ok: false; error: string };
 
 // A walk across Manhattan is a few hundred points. The cap is three orders of
 // magnitude of headroom and still bounds what one row can cost — the column is
@@ -59,7 +60,7 @@ function validPoint(p: { lat: number; lng: number } | undefined): boolean {
   );
 }
 
-export async function saveRoute(input: SaveInput): Promise<ActionResult> {
+export async function saveRoute(input: SaveInput): Promise<SaveResult> {
   const user = await getAuthenticatedUser();
   if (!user) return { ok: false, error: "Sign in to save a walk." };
 
@@ -81,7 +82,7 @@ export async function saveRoute(input: SaveInput): Promise<ActionResult> {
   const name = (input.name ?? "").trim().slice(0, 80) || null;
 
   const supabase = await createClient();
-  const { error } = await supabase.from("routes").insert({
+  const { data, error } = await supabase.from("routes").insert({
     user_id: user.id,
     name,
     origin_lat: input.origin.lat,
@@ -96,12 +97,16 @@ export async function saveRoute(input: SaveInput): Promise<ActionResult> {
     // The same exposure figure the panel shows, so a saved walk and a live one
     // are never quoting two different numbers for the same thing.
     risk_score: finite(input.riskExposure) ? input.riskExposure : null,
-  });
+  })
+    // The id comes back because a walk in progress hangs off it: every live
+    // position and every alert is stored against the route it belongs to.
+    .select("id")
+    .single();
 
-  if (error) return { ok: false, error: "Couldn't save that walk." };
+  if (error || !data) return { ok: false, error: "Couldn't save that walk." };
 
   revalidatePath("/app");
-  return { ok: true };
+  return { ok: true, id: data.id };
 }
 
 export async function deleteRoute(id: string): Promise<ActionResult> {

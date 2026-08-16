@@ -19,6 +19,10 @@
 *.graphml
 data/geocode_cache.json
 
+# OSMnx caches raw Overpass responses here — 26 MB for Manhattan alone, and
+# it regenerates on the next graph load. Never worth versioning.
+cache/
+
 # ---- Secrets -----------------------------------------------------
 # Supabase keys, Mapbox tokens
 .env
